@@ -1,7 +1,8 @@
 # UnityNetMQPython
-# 문서
+# 
+#  노션 문서
 # https://www.notion.so/Unity-NetMQ-Python-2670017842be801db1c9ef56f44434d2?showMoveTo=true&saveParent=true
-UnityNetMQPython
+# 
 # 파이썬 코드 아래 첨부
 import zmq
 import numpy as np
