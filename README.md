@@ -16,7 +16,7 @@ socket.bind("tcp://*:5555")
 
 print("AI 에코 서버 v2 (채널 지원)가 5555 포트에서 대기 중...")
 
-# --- WAV 헤더를 생성하기 위한 정보 ---
+    # --- WAV 헤더를 생성하기 위한 정보 ---
 SAMPLE_WIDTH = 2  # 16-bit 오디오 (2 bytes)
 FRAME_RATE = 44100  # Unity에서 녹음한 샘플 레이트와 동일하게 설정
 
