@@ -1,50 +1,62 @@
-using NetMQ;
+ï»¿using NetMQ;
 using NetMQ.Sockets;
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Threading;
 using UnityEngine;
 using UnityEngine.UI;
 
-// JSON Á÷·ÄÈ­¸¦ À§ÇÑ Å¬·¡½ºµé
 [Serializable]
-public class AudioPacket // º¸³¾ µ¥ÀÌÅÍ
-{
-    public int channels;
-    public string audio_b64;
-}
-
+public class AudioPacket { public int channels; public string audio_b64; }
 [Serializable]
-public class AIResponse // ¹ŞÀ» µ¥ÀÌÅÍ
-{
-    public string gesture;
-    public string audio_b64;
-}
+public class AIResponse { public string gesture; public string audio_b64; }
 
 public class AICommunicator : MonoBehaviour
 {
-    [Header("¿¬°á ¼³Á¤")]
-    public string serverAddress = "tcp://localhost:5555";
-
-    [Header("¿Àµğ¿À ¼³Á¤")]
+    [Header("ë°ì‹œë²¨ ê°ì§€ ì„¤ì •")]
+    public Slider decibelSlider;
+    public Image recordingIcon;
+    [Range(0.001f, 0.5f)]
+    public float volumeThreshold = 0.02f;
     public int recordDuration = 5;
-    private const int SampleRate = 44100;
 
-    [Header("¿¬°á ´ë»ó")]
+    [Header("UI ì„¤ì •")]
+    public float sliderSmoothing = 8f;
+
+    [Header("ì—°ê²° ëŒ€ìƒ")]
     public Animator avatarAnimator;
     public AudioSource audioSource;
-    public Button recordButton;
+
+    [Header("ì—°ê²° ì„¤ì •")]
+    public string serverAddress = "tcp://localhost:5555";
+
+    private const int SampleRate = 44100;
+    private const int MonitorClipLengthSec = 10; // ìƒì‹œ ë…¹ìŒ í´ë¦½ ê¸¸ì´ (ë„‰ë„‰í•˜ê²Œ)
 
     private Thread _networkThread;
     private bool _isRunning;
-    private readonly ConcurrentQueue<string> _sendQueue = new ConcurrentQueue<string>(); // JSON ¹®ÀÚ¿­À» ´ãÀ» Å¥
+    private readonly ConcurrentQueue<string> _sendQueue = new ConcurrentQueue<string>();
+    private string _micDevice;
+    private AudioClip _monitoringClip;
+    private float[] _monitorSampleData = new float[1024];
+    private bool _isRecording = false;
+    private float _sliderCurrentValue = 0f;
 
     void Start()
     {
-        if (recordButton != null)
+        if (Microphone.devices.Length == 0)
         {
-            recordButton.onClick.AddListener(StartRecording);
+            Debug.LogError("ë§ˆì´í¬ë¥¼ ì°¾ì„ ìˆ˜ ì—†ìŠµë‹ˆë‹¤!");
+            return;
         }
+        _micDevice = Microphone.devices[0];
+
+        if (recordingIcon != null) recordingIcon.enabled = false;
+
+        // --- í•µì‹¬ ë³€ê²½: ê²Œì„ ì‹œì‘ ì‹œ í•œ ë²ˆë§Œ, ê¸¸ê³  ë°˜ë³µë˜ëŠ” ë…¹ìŒ í´ë¦½ì„ ì‹œì‘í•©ë‹ˆë‹¤. ---
+        _monitoringClip = Microphone.Start(_micDevice, true, MonitorClipLengthSec, SampleRate);
+
         _isRunning = true;
         _networkThread = new Thread(NetworkLoop);
         _networkThread.Start();
@@ -53,12 +65,100 @@ public class AICommunicator : MonoBehaviour
     void OnDestroy()
     {
         _isRunning = false;
-        _networkThread?.Join(1000); // 1ÃÊ°£ ´ë±â
-
-        // if¹®À» Á¦°ÅÇÏ°í CleanupÀ» Á÷Á¢ È£Ãâ
+        if (!string.IsNullOrEmpty(_micDevice)) Microphone.End(_micDevice);
+        _networkThread?.Join(1000);
         NetMQConfig.Cleanup(false);
     }
 
+    void Update()
+    {
+        if (_monitoringClip == null) return;
+
+        // ë°ì‹œë²¨ ê³„ì‚° ë° ìŠ¬ë¼ì´ë” ì—…ë°ì´íŠ¸ (ì´ì „ê³¼ ë™ì¼)
+        int micPosition = Microphone.GetPosition(_micDevice);
+        int startReadPosition = micPosition - _monitorSampleData.Length;
+        if (startReadPosition < 0) return;
+
+        _monitoringClip.GetData(_monitorSampleData, startReadPosition);
+
+        float currentLinearVolume = 0;
+        foreach (var sample in _monitorSampleData)
+        {
+            currentLinearVolume += Mathf.Abs(sample);
+        }
+        currentLinearVolume /= _monitorSampleData.Length;
+
+        float targetSliderValue = 0f;
+        if (currentLinearVolume > 0.0001f)
+        {
+            float db = 20 * Mathf.Log10(currentLinearVolume);
+            targetSliderValue = Mathf.InverseLerp(-60f, 0f, db);
+        }
+        _sliderCurrentValue = Mathf.Lerp(_sliderCurrentValue, targetSliderValue, Time.deltaTime * sliderSmoothing);
+        if (decibelSlider != null) decibelSlider.value = _sliderCurrentValue;
+
+        // ë…¹ìŒ ì‹œì‘ ì¡°ê±´
+        if (!_isRecording && currentLinearVolume > volumeThreshold)
+        {
+            StartCoroutine(ProcessRecording());
+        }
+    }
+
+    // --- í•µì‹¬ ë³€ê²½: ë…¹ìŒ ì‹œí€€ìŠ¤ê°€ ë§ˆì´í¬ë¥¼ ê»ë‹¤ ì¼œì§€ ì•Šê³  ë°ì´í„°ë§Œ ë³µì‚¬í•©ë‹ˆë‹¤. ---
+    private IEnumerator ProcessRecording()
+    {
+        _isRecording = true;
+
+        avatarAnimator.SetTrigger("Listen");
+        if (recordingIcon != null) recordingIcon.enabled = true;
+        Debug.Log("ì†Œë¦¬ ê°ì§€! 5ì´ˆ í›„ ë°ì´í„°ë¥¼ ì¶”ì¶œí•©ë‹ˆë‹¤...");
+
+        // ë§ˆì´í¬ë¥¼ ë„ëŠ” ëŒ€ì‹ , 5ì´ˆë¥¼ ê¸°ë‹¤ë¦½ë‹ˆë‹¤. ê·¸ë™ì•ˆ ë§ˆì´í¬ëŠ” ê³„ì† ë…¹ìŒ ì¤‘ì…ë‹ˆë‹¤.
+        yield return new WaitForSeconds(recordDuration);
+
+        // 5ì´ˆ ëŒ€ê¸° í›„, í˜„ì¬ ìœ„ì¹˜ì—ì„œ 5ì´ˆ ë¶„ëŸ‰ì˜ ì˜¤ë””ì˜¤ ë°ì´í„°ë¥¼ ì˜ë¼ëƒ…ë‹ˆë‹¤.
+        int endPosition = Microphone.GetPosition(_micDevice);
+        int sampleCount = recordDuration * SampleRate;
+
+        float[] recordedSamples = new float[sampleCount * _monitoringClip.channels];
+
+        // ë°ì´í„°ê°€ í´ë¦½ì˜ ì‹œì‘ ë¶€ë¶„ê³¼ ë ë¶€ë¶„ì— ê±¸ì³ìˆëŠ” ê²½ìš°(Wrap-around) ì²˜ë¦¬
+        int startPosition = endPosition - sampleCount;
+        if (startPosition < 0)
+        {
+            int remainingSamples = -startPosition;
+            _monitoringClip.GetData(recordedSamples, _monitoringClip.samples - remainingSamples);
+            _monitoringClip.GetData(new Span<float>(recordedSamples, remainingSamples, endPosition), 0);
+        }
+        else
+        {
+            _monitoringClip.GetData(recordedSamples, startPosition);
+        }
+
+        // ì´í›„ ë°ì´í„° ì²˜ë¦¬ ë° ì „ì†¡ì€ ë™ì¼
+        byte[] audioBytes = new byte[recordedSamples.Length * 4];
+        Buffer.BlockCopy(recordedSamples, 0, audioBytes, 0, audioBytes.Length);
+
+        AudioPacket packet = new AudioPacket
+        {
+            channels = _monitoringClip.channels,
+            audio_b64 = Convert.ToBase64String(audioBytes)
+        };
+        string jsonRequest = JsonUtility.ToJson(packet);
+        _sendQueue.Enqueue(jsonRequest);
+
+        Debug.Log($"ë°ì´í„° ì¶”ì¶œ ì™„ë£Œ. (ì±„ë„: {_monitoringClip.channels})");
+
+        if (recordingIcon != null) recordingIcon.enabled = false;
+
+        // ë‹¤ì‹œ ë…¹ìŒì´ ê°€ëŠ¥í•˜ë„ë¡ í”Œë˜ê·¸ë¥¼ í’€ì–´ì¤ë‹ˆë‹¤.
+        // ì•½ê°„ì˜ ë”œë ˆì´ë¥¼ ì£¼ì–´ ì—°ì†ì ì¸ ë…¹ìŒì„ ë°©ì§€í•©ë‹ˆë‹¤.
+        yield return new WaitForSeconds(1f);
+        _isRecording = false;
+    }
+
+    // --- ë‚˜ë¨¸ì§€ ì½”ë“œëŠ” ì´ì „ê³¼ ë™ì¼í•©ë‹ˆë‹¤ ---
+    #region Unchanged Code
     private void NetworkLoop()
     {
         AsyncIO.ForceDotNet.Force();
@@ -70,15 +170,11 @@ public class AICommunicator : MonoBehaviour
                 if (_sendQueue.TryDequeue(out var jsonRequest))
                 {
                     client.TrySendFrame(jsonRequest);
-
                     if (client.TryReceiveFrameString(TimeSpan.FromSeconds(20), out var jsonResponse))
                     {
                         UnityMainThreadDispatcher.Instance().Enqueue(() => ProcessResponse(jsonResponse));
                     }
-                    else
-                    {
-                        Debug.LogError("¼­¹ö ÀÀ´ä ½Ã°£ ÃÊ°ú!");
-                    }
+                    else Debug.LogError("ì„œë²„ ì‘ë‹µ ì‹œê°„ ì´ˆê³¼!");
                 }
                 Thread.Sleep(50);
             }
@@ -88,15 +184,7 @@ public class AICommunicator : MonoBehaviour
     private void ProcessResponse(string json)
     {
         if (string.IsNullOrEmpty(json)) return;
-
-        Debug.Log("¼­¹ö·ÎºÎÅÍ ÀÀ´ä ¹ŞÀ½: " + json.Substring(0, Math.Min(json.Length, 100)));
         AIResponse response = JsonUtility.FromJson<AIResponse>(json);
-
-        if (avatarAnimator != null && !string.IsNullOrEmpty(response.gesture))
-        {
-            avatarAnimator.SetTrigger(response.gesture);
-            Debug.Log($"Á¦½ºÃ³ ½ÇÇà: {response.gesture}");
-        }
 
         if (audioSource != null && !string.IsNullOrEmpty(response.audio_b64))
         {
@@ -104,49 +192,23 @@ public class AICommunicator : MonoBehaviour
             AudioClip clip = WavUtility.ToAudioClip(responseAudioBytes);
             if (clip != null)
             {
-                audioSource.PlayOneShot(clip);
-                Debug.Log("ÀÀ´ä À½¼º Àç»ı!");
+                StartCoroutine(PlayAudioAndAnimate(clip, response.gesture));
             }
         }
     }
 
-    public void StartRecording()
+    private IEnumerator PlayAudioAndAnimate(AudioClip clip, string gesture)
     {
-        Debug.Log("³ìÀ½À» ½ÃÀÛÇÕ´Ï´Ù...");
-        var audioClip = Microphone.Start(null, false, recordDuration, SampleRate);
-        StartCoroutine(WaitForRecordingToEnd(audioClip));
-        if (recordButton != null) recordButton.interactable = false;
-    }
-
-    private System.Collections.IEnumerator WaitForRecordingToEnd(AudioClip clip)
-    {
-        yield return new WaitForSeconds(recordDuration);
-
-        // --- µğ¹ö±ë¿ë: ³ìÀ½µÈ ¼Ò¸®¸¦ ¹Ù·Î Àç»ıÇØ¼­ È®ÀÎ ---
-        Debug.Log("µğ¹ö±ë: ³ìÀ½µÈ Å¬¸³À» ¹Ù·Î Àç»ıÇÕ´Ï´Ù.");
-        audioSource.PlayOneShot(clip);
-        // -----------------------------------------
-
-        // ³ìÀ½µÈ ¿Àµğ¿À µ¥ÀÌÅÍ¸¦ float[] ¹è¿­·Î °¡Á®¿È
-        float[] samples = new float[clip.samples * clip.channels];
-        clip.GetData(samples, 0);
-
-        // float[]¸¦ byte[]·Î º¯È¯
-        byte[] audioBytes = new byte[samples.Length * 4];
-        Buffer.BlockCopy(samples, 0, audioBytes, 0, audioBytes.Length);
-
-        // ¿Àµğ¿À µ¥ÀÌÅÍ¿Í Ã¤³Î ¼ö¸¦ ÇÔ²² ÆĞÅ°Â¡
-        AudioPacket packet = new AudioPacket
+        if (avatarAnimator != null && !string.IsNullOrEmpty(gesture))
         {
-            channels = clip.channels,
-            audio_b64 = Convert.ToBase64String(audioBytes)
-        };
+            avatarAnimator.SetTrigger("Talk");
+        }
 
-        // JSON ¹®ÀÚ¿­·Î º¯È¯ÇÏ¿© Å¥¿¡ Ãß°¡
-        string jsonRequest = JsonUtility.ToJson(packet);
-        _sendQueue.Enqueue(jsonRequest);
+        audioSource.PlayOneShot(clip);
 
-        Debug.Log($"³ìÀ½ ¿Ï·á. (Ã¤³Î: {clip.channels}) µ¥ÀÌÅÍ¸¦ Àü¼Û Å¥¿¡ Ãß°¡Çß½À´Ï´Ù.");
-        if (recordButton != null) recordButton.interactable = true;
+        yield return new WaitForSeconds(clip.length);
+
+        avatarAnimator.SetTrigger("Idle");
     }
+    #endregion
 }
